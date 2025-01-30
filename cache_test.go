@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sashabaranov/go-openai"
 	"github.com/stretchr/testify/require"
@@ -31,7 +32,7 @@ func TestCache(t *testing.T) {
 				Content: "first 4 natural numbers",
 			},
 			{
-				Role:    openai.ChatMessageRoleSystem,
+				Role:    openai.ChatMessageRoleAssistant,
 				Content: "1, 2, 3, 4",
 			},
 		}
@@ -70,11 +71,15 @@ func TestCachedCompletionStream(t *testing.T) {
 	stream := cachedCompletionStream{
 		messages: []openai.ChatCompletionMessage{
 			{
+				Role:    openai.ChatMessageRoleSystem,
+				Content: "you are a medieval king",
+			},
+			{
 				Role:    openai.ChatMessageRoleUser,
 				Content: "first 4 natural numbers",
 			},
 			{
-				Role:    openai.ChatMessageRoleSystem,
+				Role:    openai.ChatMessageRoleAssistant,
 				Content: "1, 2, 3, 4",
 			},
 
@@ -83,7 +88,7 @@ func TestCachedCompletionStream(t *testing.T) {
 				Content: "as a json array",
 			},
 			{
-				Role:    openai.ChatMessageRoleSystem,
+				Role:    openai.ChatMessageRoleAssistant,
 				Content: "[ 1, 2, 3, 4 ]",
 			},
 			{
@@ -96,7 +101,7 @@ func TestCachedCompletionStream(t *testing.T) {
 			},
 		},
 	}
-	t.Cleanup(stream.Close)
+	t.Cleanup(func() { require.NoError(t, stream.Close()) })
 
 	var output []string
 
@@ -119,4 +124,93 @@ func TestCachedCompletionStream(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, string(bytes.ReplaceAll(bts, []byte("\r\n"), []byte("\n"))), content)
+}
+
+func TestExpiringCache(t *testing.T) {
+	t.Run("write and read", func(t *testing.T) {
+		config.CachePath = t.TempDir()
+		cache, err := NewExpiringCache[string]()
+		require.NoError(t, err)
+
+		// Write a value with expiry
+		data := "test data"
+		expiresAt := time.Now().Add(time.Hour).Unix()
+		err = cache.Write("test", expiresAt, func(w io.Writer) error {
+			_, err := w.Write([]byte(data))
+			return err
+		})
+		require.NoError(t, err)
+
+		// Read it back
+		var result string
+		err = cache.Read("test", func(r io.Reader) error {
+			b, err := io.ReadAll(r)
+			if err != nil {
+				return err
+			}
+			result = string(b)
+			return nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, data, result)
+	})
+
+	t.Run("expired token", func(t *testing.T) {
+		config.CachePath = t.TempDir()
+		cache, err := NewExpiringCache[string]()
+		require.NoError(t, err)
+
+		// Write a value that's already expired
+		data := "test data"
+		expiresAt := time.Now().Add(-time.Hour).Unix() // expired 1 hour ago
+		err = cache.Write("test", expiresAt, func(w io.Writer) error {
+			_, err := w.Write([]byte(data))
+			return err
+		})
+		require.NoError(t, err)
+
+		// Try to read it
+		err = cache.Read("test", func(r io.Reader) error {
+			return nil
+		})
+		require.Error(t, err)
+		require.True(t, os.IsNotExist(err))
+	})
+
+	t.Run("overwrite token", func(t *testing.T) {
+		config.CachePath = t.TempDir()
+		cache, err := NewExpiringCache[string]()
+		require.NoError(t, err)
+
+		// Write initial value
+		data1 := "test data 1"
+		expiresAt1 := time.Now().Add(time.Hour).Unix()
+		err = cache.Write("test", expiresAt1, func(w io.Writer) error {
+			_, err := w.Write([]byte(data1))
+			return err
+		})
+		require.NoError(t, err)
+
+		// Write new value
+		data2 := "test data 2"
+		expiresAt2 := time.Now().Add(2 * time.Hour).Unix()
+		err = cache.Write("test", expiresAt2, func(w io.Writer) error {
+			_, err := w.Write([]byte(data2))
+			return err
+		})
+		require.NoError(t, err)
+
+		// Read it back - should get the new value
+		var result string
+		err = cache.Read("test", func(r io.Reader) error {
+			b, err := io.ReadAll(r)
+			if err != nil {
+				return err
+			}
+			result = string(b)
+			return nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, data2, result)
+	})
 }

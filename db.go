@@ -41,29 +41,49 @@ func openDB(ds string) (*convoDB, error) {
 		)
 	}
 	if _, err := db.Exec(`
-		create table if not exists conversations(
-			id string not null primary key,
-			title string not null,
-			updated_at datetime not null default(strftime('%Y-%m-%d %H:%M:%f', 'now')),
-			check(id <> ''),
-			check(title <> '')
-		)
+		CREATE TABLE
+		  IF NOT EXISTS conversations (
+		    id string NOT NULL PRIMARY KEY,
+		    title string NOT NULL,
+		    updated_at datetime NOT NULL DEFAULT (strftime ('%Y-%m-%d %H:%M:%f', 'now')),
+		    CHECK (id <> ''),
+		    CHECK (title <> '')
+		  )
 	`); err != nil {
 		return nil, fmt.Errorf("could not migrate db: %w", err)
 	}
 	if _, err := db.Exec(`
-		create index if not exists idx_conv_id
-		on conversations(id)
+		CREATE INDEX IF NOT EXISTS idx_conv_id ON conversations (id)
 	`); err != nil {
 		return nil, fmt.Errorf("could not migrate db: %w", err)
 	}
 	if _, err := db.Exec(`
-		create index if not exists idx_conv_title
-		on conversations(title)
+		CREATE INDEX IF NOT EXISTS idx_conv_title ON conversations (title)
 	`); err != nil {
 		return nil, fmt.Errorf("could not migrate db: %w", err)
 	}
+
+	if !hasColumn(db, "model") {
+		if _, err := db.Exec(`
+			ALTER TABLE conversations ADD COLUMN model string
+		`); err != nil {
+			return nil, fmt.Errorf("could not migrate db: %w", err)
+		}
+	}
+
 	return &convoDB{db: db}, nil
+}
+
+func hasColumn(db *sqlx.DB, col string) bool {
+	var count int
+	if err := db.Get(&count, `
+		SELECT count(*)
+		FROM pragma_table_info('conversations') c
+		WHERE c.name = $1
+	`, col); err != nil {
+		return false
+	}
+	return count > 0
 }
 
 type convoDB struct {
@@ -75,18 +95,23 @@ type Conversation struct {
 	ID        string    `db:"id"`
 	Title     string    `db:"title"`
 	UpdatedAt time.Time `db:"updated_at"`
+	Model     *string   `db:"model"`
 }
 
 func (c *convoDB) Close() error {
 	return c.db.Close() //nolint: wrapcheck
 }
 
-func (c *convoDB) Save(id, title string) error {
+func (c *convoDB) Save(id, title, model string) error {
 	res, err := c.db.Exec(c.db.Rebind(`
-		update conversations
-		set title = ?, updated_at = current_timestamp
-		where id = ?
-	`), title, id)
+		UPDATE conversations
+		SET
+		  title = ?,
+		  model = ?,
+		  updated_at = CURRENT_TIMESTAMP
+		WHERE
+		  id = ?
+	`), title, model, id)
 	if err != nil {
 		return fmt.Errorf("Save: %w", err)
 	}
@@ -101,9 +126,11 @@ func (c *convoDB) Save(id, title string) error {
 	}
 
 	if _, err := c.db.Exec(c.db.Rebind(`
-		insert into conversations (id, title)
-		values (?, ?)
-	`), id, title); err != nil {
+		INSERT INTO
+		  conversations (id, title, model)
+		VALUES
+		  (?, ?, ?)
+	`), id, title, model); err != nil {
 		return fmt.Errorf("Save: %w", err)
 	}
 
@@ -112,21 +139,41 @@ func (c *convoDB) Save(id, title string) error {
 
 func (c *convoDB) Delete(id string) error {
 	if _, err := c.db.Exec(c.db.Rebind(`
-		delete from conversations
-		where id = ?
+		DELETE FROM conversations
+		WHERE
+		  id = ?
 	`), id); err != nil {
 		return fmt.Errorf("Delete: %w", err)
 	}
 	return nil
 }
 
+func (c *convoDB) ListOlderThan(t time.Duration) ([]Conversation, error) {
+	var convos []Conversation
+	if err := c.db.Select(&convos, c.db.Rebind(`
+		SELECT
+		  *
+		FROM
+		  conversations
+		WHERE
+		  updated_at < ?
+		`), time.Now().Add(-t)); err != nil {
+		return nil, fmt.Errorf("ListOlderThan: %w", err)
+	}
+	return convos, nil
+}
+
 func (c *convoDB) FindHEAD() (*Conversation, error) {
 	var convo Conversation
 	if err := c.db.Get(&convo, `
-		select *
-		from conversations
-		order by updated_at desc
-		limit 1
+		SELECT
+		  *
+		FROM
+		  conversations
+		ORDER BY
+		  updated_at DESC
+		LIMIT
+		  1
 	`); err != nil {
 		return nil, fmt.Errorf("FindHead: %w", err)
 	}
@@ -135,9 +182,12 @@ func (c *convoDB) FindHEAD() (*Conversation, error) {
 
 func (c *convoDB) findByExactTitle(result *[]Conversation, in string) error {
 	if err := c.db.Select(result, c.db.Rebind(`
-		select *
-		from conversations
-		where title = ?
+		SELECT
+		  *
+		FROM
+		  conversations
+		WHERE
+		  title = ?
 	`), in); err != nil {
 		return fmt.Errorf("findByExactTitle: %w", err)
 	}
@@ -146,10 +196,13 @@ func (c *convoDB) findByExactTitle(result *[]Conversation, in string) error {
 
 func (c *convoDB) findByIDOrTitle(result *[]Conversation, in string) error {
 	if err := c.db.Select(result, c.db.Rebind(`
-		select *
-		from conversations
-		where id glob ?
-		or title = ?
+		SELECT
+		  *
+		FROM
+		  conversations
+		WHERE
+		  id glob ?
+		  OR title = ?
 	`), in+"*", in); err != nil {
 		return fmt.Errorf("findByIDOrTitle: %w", err)
 	}
@@ -159,28 +212,27 @@ func (c *convoDB) findByIDOrTitle(result *[]Conversation, in string) error {
 func (c *convoDB) Completions(in string) ([]string, error) {
 	var result []string
 	if err := c.db.Select(&result, c.db.Rebind(`
-		select printf(
-			'%s%c%s',
-			case
-			when length(?) < ? then
-				substr(id, 1, ?)
-			else
-				id
-			end,
-			char(9),
-			title
-		)
-		from conversations where id glob ?
-		union
-		select
-			printf(
-				"%s%c%s",
-				title,
-				char(9),
-				substr(id, 1, ?)
-		)
-		from conversations
-		where title glob ?
+		SELECT
+		  printf (
+		    '%s%c%s',
+		    CASE
+		      WHEN length (?) < ? THEN substr (id, 1, ?)
+		      ELSE id
+		    END,
+		    char(9),
+		    title
+		  )
+		FROM
+		  conversations
+		WHERE
+		  id glob ?
+		UNION
+		SELECT
+		  printf ("%s%c%s", title, char(9), substr (id, 1, ?))
+		FROM
+		  conversations
+		WHERE
+		  title glob ?
 	`), in, sha1short, sha1short, in+"*", sha1short, in+"*"); err != nil {
 		return result, fmt.Errorf("Completions: %w", err)
 	}
@@ -197,24 +249,27 @@ func (c *convoDB) Find(in string) (*Conversation, error) {
 		err = c.findByIDOrTitle(&conversations, in)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("Find: %w", err)
+		return nil, fmt.Errorf("Find %q: %w", in, err)
 	}
 
 	if len(conversations) > 1 {
-		return nil, errManyMatches
+		return nil, fmt.Errorf("%w: %s", errManyMatches, in)
 	}
 	if len(conversations) == 1 {
 		return &conversations[0], nil
 	}
-	return nil, errNoMatches
+	return nil, fmt.Errorf("%w: %s", errNoMatches, in)
 }
 
 func (c *convoDB) List() ([]Conversation, error) {
 	var convos []Conversation
 	if err := c.db.Select(&convos, `
-		select *
-		from conversations
-		order by updated_at desc
+		SELECT
+		  *
+		FROM
+		  conversations
+		ORDER BY
+		  updated_at DESC
 	`); err != nil {
 		return convos, fmt.Errorf("List: %w", err)
 	}
