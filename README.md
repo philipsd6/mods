@@ -1,4 +1,4 @@
-# Mods!
+# Mods
 
 <p>
     <img src="https://github.com/charmbracelet/mods/assets/25087/5442bf46-b908-47af-bf4e-60f7c38951c4" width="630" alt="Mods product art and type treatment"/>
@@ -11,67 +11,54 @@ AI for the command line, built for pipelines.
 
 <p><img src="https://vhs.charm.sh/vhs-5Uyj0U6Hlqi1LVIIRyYKM5.gif" width="900" alt="a GIF of mods running"></p>
 
-LLM based AI is really good at interpreting the output of commands and
-returning the results in CLI friendly text formats like Markdown. Mods is a
-simple tool that makes it super easy to use AI on the command line and in your
-pipelines. Mods works with [OpenAI](https://platform.openai.com/account/api-keys)
-and [LocalAI](https://github.com/go-skynet/LocalAI)
+Large Language Models (LLM) based AI is useful to ingest command output and
+format results in Markdown, JSON, and other text based formats. Mods is a
+tool to add a sprinkle of AI in your command line and make your pipelines
+artificially intelligent.
 
-To get started, [install Mods](#installation) and check out some of the
-examples below. Since Mods has built-in Markdown formatting, you may also want
-to grab [Glow](https://github.com/charmbracelet/glow) to give the output some
-_pizzazz_.
+It works great with LLMs running locally through [LocalAI]. You can also use
+[OpenAI], [Cohere], [Groq], or [Azure OpenAI].
 
-## What Can It Do?
+[LocalAI]: https://github.com/go-skynet/LocalAI
+[OpenAI]: https://platform.openai.com/account/api-keys
+[Cohere]: https://dashboard.cohere.com/api-keys
+[Groq]: https://console.groq.com/keys
+[Azure OpenAI]: https://azure.microsoft.com/en-us/products/cognitive-services/openai-service
 
-Mods works by reading standard in and prefacing it with a prompt supplied in
-the `mods` arguments. It sends the input text to an LLM and prints out the
-result, optionally asking the LLM to format the response as Markdown. This
-gives you a way to "question" the output of a command. Mods will also work on
-standard in or an argument supplied prompt individually.
+### Installation
 
-Be sure to check out the [examples](examples.md) and a list of all the
-[features](features.md).
-
-## Installation
-
-Mods works with OpenAI compatible endpoints. By default, Mods is configured to
-support OpenAI's official API and a LocalAI installation running on port 8080.
-You can configure additional endpoints in your settings file by running
-`mods --settings`.
-
-### OpenAI
-
-Mods uses GPT-4 by default and will fallback to GPT-3.5 Turbo if it's not
-available. Set the `OPENAI_API_KEY` environment variable to a valid OpenAI key,
-which you can get [from here](https://platform.openai.com/account/api-keys).
-
-Mods can also use the [Azure OpenAI](https://azure.microsoft.com/en-us/products/cognitive-services/openai-service)
-service. Set the `AZURE_OPENAI_KEY` environment variable and configure your
-Azure endpoint with `mods --settings`.
-
-### LocalAI
-
-LocalAI allows you to run a multitude of models locally. Mods works with the
-GPT4ALL-J model as setup in [this tutorial](https://github.com/go-skynet/LocalAI#example-use-gpt4all-j-model).
-You can define more LocalAI models and endpoints with `mods --settings`.
-
-### Install Mods
+Use a package manager:
 
 ```bash
 # macOS or Linux
 brew install charmbracelet/tap/mods
 
+# Windows (with Winget)
+winget install charmbracelet.mods
+
 # Arch Linux (btw)
 yay -S mods
 
-# Debian/Ubuntu
+# Nix
+nix-shell -p mods
+```
+
+<details>
+<summary>Debian/Ubuntu</summary>
+
+```bash
 sudo mkdir -p /etc/apt/keyrings
 curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg
 echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list
 sudo apt update && sudo apt install mods
+```
 
-# Fedora/RHEL
+</details>
+
+<details>
+<summary>Fedora/RHEL</summary>
+
+```bash
 echo '[charm]
 name=Charm
 baseurl=https://repo.charm.sh/yum/
@@ -80,6 +67,8 @@ gpgcheck=1
 gpgkey=https://repo.charm.sh/yum/gpg.key' | sudo tee /etc/yum.repos.d/charm.repo
 sudo yum install mods
 ```
+
+</details>
 
 Or, download it:
 
@@ -94,160 +83,139 @@ Or, just install it with `go`:
 go install github.com/charmbracelet/mods@latest
 ```
 
-## Saving conversations
+<details>
+<summary>Shell Completions</summary>
+
+All the packages and archives come with pre-generated completion files for Bash,
+ZSH, Fish, and PowerShell.
+
+If you built it from source, you can generate them with:
 
-Conversations save automatically. They are identified by their latest prompt.
-Similar to Git, conversations have a SHA-1 identifier and a title. Conversations
-can be updated, maintaining their SHA-1 identifier but changing their title.
+```bash
+mods completion bash -h
+mods completion zsh -h
+mods completion fish -h
+mods completion powershell -h
+```
 
-Check the [features document](./features.md) for more details.
+If you use a package (like Homebrew, Debs, etc), the completions should be set
+up automatically, given your shell is configured properly.
 
-<p><img src="https://vhs.charm.sh/vhs-6MMscpZwgzohYYMfTrHErF.gif" width="900" alt="a GIF listing and showing saved conversations."></p>
+</details>
 
-## Settings
+## What Can It Do?
 
-`--settings`
+Mods works by reading standard in and prefacing it with a prompt supplied in
+the `mods` arguments. It sends the input text to an LLM and prints out the
+result, optionally asking the LLM to format the response as Markdown. This
+gives you a way to "question" the output of a command. Mods will also work on
+standard in or an argument supplied prompt individually.
 
-Mods lets you tune your query with a variety of settings. You can configure
-Mods with `mods --settings` or pass the settings as environment variables
-and flags.
+Be sure to check out the [examples](examples.md) and a list of all the
+[features](features.md).
 
-#### Model
+Mods works with OpenAI compatible endpoints. By default, Mods is configured to
+support OpenAI's official API and a LocalAI installation running on port 8080.
+You can configure additional endpoints in your settings file by running
+`mods --settings`.
 
-`-m`, `--model`, `MODS_MODEL`
+## Saved Conversations
 
-Mods uses `gpt-4` with OpenAI by default but you can specify any model as long
-as your account has access to it or you have installed locally with LocalAI.
+Conversations are saved locally by default. Each conversation has a SHA-1
+identifier and a title (like `git`!).
 
-You can add new models to the settings with `mods --settings`.
-You can also specify a model and an API endpoint with `-m` and `-a`
-to use models not in the settings file.
+<p>
+  <img src="https://vhs.charm.sh/vhs-6MMscpZwgzohYYMfTrHErF.gif" width="900" alt="a GIF listing and showing saved conversations.">
+</p>
 
-#### Title
+Check the [`./features.md`](./features.md) for more details.
 
-`-t`, `--title`
+## Usage
 
-Set a custom save title for the conversation.
+- `-m`, `--model`: Specify Large Language Model to use.
+- `-f`, `--format`: Ask the LLM to format the response in a given format.
+- `--format-as`: Specify the format for the output (used with `--format`).
+- `-P`, `--prompt` Include the prompt from the arguments and stdin, truncate stdin to specified number of lines.
+- `-p`, `--prompt-args`: Include the prompt from the arguments in the response.
+- `-q`, `--quiet`: Only output errors to standard err.
+- `-r`, `--raw`: Print raw response without syntax highlighting.
+- `--settings`: Open settings.
+- `-x`, `--http-proxy`: Use HTTP proxy to connect to the API endpoints.
+- `--max-retries`: Maximum number of retries.
+- `--max-tokens`: Specify maximum tokens with which to respond.
+- `--no-limit`: Do not limit the response tokens.
+- `--role`: Specify the role to use (See [custom roles](#custom-roles)).
+- `--word-wrap`: Wrap output at width (defaults to 80)
+- `--reset-settings`: Restore settings to default.
 
-#### Continue last
+#### Conversations
 
-`-C`, `--continue-last`
+- `-t`, `--title`: Set the title for the conversation.
+- `-l`, `--list`: List saved conversations.
+- `-c`, `--continue`: Continue from last response or specific title or SHA-1.
+- `-C`, `--continue-last`: Continue the last conversation.
+- `-s`, `--show`: Show saved conversation for the given title or SHA-1.
+- `-S`, `--show-last`: Show previous conversation.
+- `--delete-older-than=<duration>`: Deletes conversations older than given duration (`10d`, `1mo`).
+- `--delete`: Deletes the saved conversations for the given titles or SHA-1s.
+- `--no-cache`: Do not save conversations.
 
-Continues the previous conversation.
+#### Advanced
 
-#### Continue
+- `--fanciness`: Level of fanciness.
+- `--temp`: Sampling temperature.
+- `--topp`: Top P value.
+- `--topk`: Top K value.
 
-`-c`, `--continue`
+## Custom Roles
 
-Continue from the last response or a given title or SHA1.
+Roles allow you to set system prompts. Here is an example of a `shell` role:
 
-#### List
+```yaml
+roles:
+  shell:
+    - you are a shell expert
+    - you do not explain anything
+    - you simply output one liners to solve the problems you're asked
+    - you do not provide any explanation whatsoever, ONLY the command
+```
 
-`-l`, `--list`
+Then, use the custom role in `mods`:
 
-Lists all saved conversations.
+```sh
+mods --role shell list files in the current directory
+```
 
-#### Show
+## Setup
 
-`-s`, `--show`
+### Open AI
 
-Show the saved conversation the given title or SHA1.
+Mods uses GPT-4 by default. It will fall back to GPT-3.5 Turbo.
 
-#### Delete
+Set the `OPENAI_API_KEY` environment variable. If you don't have one yet, you
+can grab it the [OpenAI website](https://platform.openai.com/account/api-keys).
 
-`--delete`
+Alternatively, set the [`AZURE_OPENAI_KEY`] environment variable to use Azure
+OpenAI. Grab a key from [Azure](https://azure.microsoft.com/en-us/products/cognitive-services/openai-service).
 
-Deletes the saved conversation with the given title or SHA1.
+### Cohere
 
-#### Format As Markdown
+Cohere provides enterprise optimized models.
 
-`-f`, `--format`, `MODS_FORMAT`
+Set the `COHERE_API_KEY` environment variable. If you don't have one yet, you can
+get it from the [Cohere dashboard](https://dashboard.cohere.com/api-keys).
 
-Ask the LLM to format the response as markdown. You can edit the text passed to
-the LLM with `mods --settings` then changing the `format-text` value.
+### Local AI
 
-#### Max Tokens
+Local AI allows you to run models locally. Mods works with the GPT4ALL-J model
+as setup in [this tutorial](https://github.com/go-skynet/LocalAI#example-use-gpt4all-j-model).
 
-`--max-tokens`, `MODS_MAX_TOKENS`
+### Groq
 
-Max tokens tells the LLM to respond in less than this number of tokens. LLMs
-are better at longer responses so values larger than 256 tend to work best.
+Groq provides models powered by their LPU inference engine.
 
-#### Temperature
-
-`--temp`, `MODS_TEMP`
-
-Sampling temperature is a number between 0.0 and 2.0 and determines how
-confident the model is in its choices. Higher values make the output more
-random and lower values make it more deterministic.
-
-#### TopP
-
-`--topp`, `MODS_TOPP`
-
-Top P is an alternative to sampling temperature. It's a number between 0.0 and
-2.0 with smaller numbers narrowing the domain from which the model will create
-its response.
-
-#### No Limit
-
-`--no-limit`, `MODS_NO_LIMIT`
-
-By default Mods attempts to size the input to the maximum size the allowed by
-the model. You can potentially squeeze a few more tokens into the input by
-setting this but also risk getting a max token exceeded error from the OpenAI API.
-
-#### Include Prompt
-
-`-P`, `--prompt`, `MODS_INCLUDE_PROMPT`
-
-Include prompt will preface the response with the entire prompt, both standard
-in and the prompt supplied by the arguments.
-
-#### Include Prompt Args
-
-`-p`, `--prompt-args`, `MODS_INCLUDE_PROMPT_ARGS`
-
-Include prompt args will include _only_ the prompt supplied by the arguments.
-This can be useful if your standard in content is long and you just a want a
-summary before the response.
-
-#### Max Retries
-
-`--max-retries`, `MODS_MAX_RETRIES`
-
-The maximum number of retries to failed API calls. The retries happen with an
-exponential backoff.
-
-#### Fanciness
-
-`--fanciness`, `MODS_FANCINESS`
-
-Your desired level of fanciness.
-
-#### Quiet
-
-`-q`, `--quiet`, `MODS_QUIET`
-
-Output nothing to standard err.
-
-#### Reset Settings
-
-`--reset-settings`
-
-Backup your old settings file and reset everything to the defaults.
-
-#### No Cache
-
-`--no-cache`, `MODS_NO_CACHE`
-
-Disables conversation saving.
-
-#### HTTP Proxy
-
-`-x`, `--http-proxy`, `MODS_HTTP_PROXY`
-
-Use the HTTP proxy to the connect the API endpoints.
+Set the `GROQ_API_KEY` environment variable. If you don't have one yet, you can
+get it from the [Groq console](https://console.groq.com/keys).
 
 ## Whatcha Think?
 

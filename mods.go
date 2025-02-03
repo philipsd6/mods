@@ -10,15 +10,20 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 
+	"github.com/caarlos0/go-shellwords"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/exp/ordered"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -42,6 +47,7 @@ type Mods struct {
 	Error         *modsError
 	state         state
 	retries       int
+	system        string
 	renderer      *lipgloss.Renderer
 	glam          *glamour.TermRenderer
 	glamViewport  viewport.Model
@@ -59,11 +65,10 @@ type Mods struct {
 
 	content      []string
 	contentMutex *sync.Mutex
-	clearOnce    *sync.Once
 }
 
 func newMods(r *lipgloss.Renderer, cfg *Config, db *convoDB, cache *convoCache) *Mods {
-	gr, _ := glamour.NewTermRenderer(glamour.WithEnvironmentConfig())
+	gr, _ := glamour.NewTermRenderer(glamour.WithEnvironmentConfig(), glamour.WithWordWrap(cfg.WordWrap))
 	vp := viewport.New(0, 0)
 	vp.GotoBottom()
 	return &Mods{
@@ -73,7 +78,6 @@ func newMods(r *lipgloss.Renderer, cfg *Config, db *convoDB, cache *convoCache) 
 		renderer:     r,
 		glamViewport: vp,
 		contentMutex: &sync.Mutex{},
-		clearOnce:    &sync.Once{},
 		db:           db,
 		cache:        cache,
 		Config:       cfg,
@@ -93,17 +97,7 @@ type completionOutput struct {
 
 type chatCompletionReceiver interface {
 	Recv() (openai.ChatCompletionStreamResponse, error)
-	Close()
-}
-
-// modsError is a wrapper around an error that adds additional context.
-type modsError struct {
-	err    error
-	reason string
-}
-
-func (m modsError) Error() string {
-	return m.err.Error()
+	Close() error
 }
 
 // Init implements tea.Model.
@@ -113,24 +107,49 @@ func (m *Mods) Init() tea.Cmd {
 
 // Update implements tea.Model.
 func (m *Mods) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd
 	var cmds []tea.Cmd
 	switch msg := msg.(type) {
 	case cacheDetailsMsg:
 		m.Config.cacheWriteToID = msg.WriteID
 		m.Config.cacheWriteToTitle = msg.Title
 		m.Config.cacheReadFromID = msg.ReadID
+		m.Config.Model = msg.Model
 
-		m.anim = newAnim(m.Config.Fanciness, m.Config.StatusText, m.renderer, m.Styles)
+		if !m.Config.Quiet {
+			m.anim = newAnim(m.Config.Fanciness, m.Config.StatusText, m.renderer, m.Styles)
+			cmds = append(cmds, m.anim.Init())
+		}
 		m.state = configLoadedState
-		cmds = append(cmds, readStdinCmd, m.anim.Init())
+		cmds = append(cmds, m.readStdinCmd)
 
 	case completionInput:
 		if msg.content != "" {
-			m.Input = msg.content
+			m.Input = removeWhitespace(msg.content)
 		}
-		if msg.content == "" && m.Config.Prefix == "" && m.Config.Show == "" {
+		if m.Input == "" && m.Config.Prefix == "" && m.Config.Show == "" && !m.Config.ShowLast {
 			return m, m.quit
+		}
+		if m.Config.Dirs ||
+			len(m.Config.Delete) > 0 ||
+			m.Config.DeleteOlderThan != 0 ||
+			m.Config.ShowHelp ||
+			m.Config.List ||
+			m.Config.ListRoles ||
+			m.Config.Settings ||
+			m.Config.ResetSettings {
+			return m, m.quit
+		}
+
+		if m.Config.IncludePromptArgs {
+			m.appendToOutput(m.Config.Prefix + "\n\n")
+		}
+
+		if m.Config.IncludePrompt > 0 {
+			parts := strings.Split(m.Input, "\n")
+			if len(parts) > m.Config.IncludePrompt {
+				parts = parts[0:m.Config.IncludePrompt]
+			}
+			m.appendToOutput(strings.Join(parts, "\n") + "\n")
 		}
 		m.state = requestState
 		cmds = append(cmds, m.startCompletionCmd(msg.content))
@@ -140,30 +159,7 @@ func (m *Mods) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.quit
 		}
 		if msg.content != "" {
-			m.Output += msg.content
-			if !isOutputTTY() {
-				m.contentMutex.Lock()
-				m.content = append(m.content, msg.content)
-				m.contentMutex.Unlock()
-			}
-			if m.Config.Glamour {
-				const tabWidth = 4
-				wasAtBottom := m.glamViewport.ScrollPercent() == 1.0
-				oldHeight := m.glamHeight
-				m.glamOutput, _ = m.glam.Render(m.Output)
-				m.glamOutput = strings.TrimRightFunc(m.glamOutput, unicode.IsSpace)
-				m.glamOutput = strings.ReplaceAll(m.glamOutput, "\t", strings.Repeat(" ", tabWidth))
-				m.glamHeight = lipgloss.Height(m.glamOutput)
-				m.glamOutput += "\n"
-				truncatedGlamOutput := m.renderer.NewStyle().MaxWidth(m.width).Render(m.glamOutput)
-				m.glamViewport.SetContent(truncatedGlamOutput)
-				if oldHeight < m.glamHeight && wasAtBottom {
-					// If the viewport's at the bottom and we've received a new
-					// line of content, follow the output by auto scrolling to
-					// the bottom.
-					m.glamViewport.GotoBottom()
-				}
-			}
+			m.appendToOutput(msg.content)
 			m.state = responseState
 		}
 		cmds = append(cmds, m.receiveCompletionStreamCmd(msg))
@@ -183,16 +179,18 @@ func (m *Mods) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.quit
 		}
 	}
-	if m.state == configLoadedState || m.state == requestState {
+	if !m.Config.Quiet && (m.state == configLoadedState || m.state == requestState) {
+		var cmd tea.Cmd
 		m.anim, cmd = m.anim.Update(msg)
 		cmds = append(cmds, cmd)
 	}
 	if m.viewportNeeded() {
 		// Only respond to keypresses when the viewport (i.e. the content) is
 		// taller than the window.
+		var cmd tea.Cmd
 		m.glamViewport, cmd = m.glamViewport.Update(msg)
+		cmds = append(cmds, cmd)
 	}
-	cmds = append(cmds, cmd)
 	return m, tea.Batch(cmds...)
 }
 
@@ -211,7 +209,7 @@ func (m *Mods) View() string {
 			return m.anim.View()
 		}
 	case responseState:
-		if m.Config.Glamour {
+		if !m.Config.Raw && isOutputTTY() {
 			if m.viewportNeeded() {
 				return m.glamViewport.View()
 			}
@@ -219,13 +217,10 @@ func (m *Mods) View() string {
 			return m.glamOutput
 		}
 
-		if isOutputTTY() {
+		if isOutputTTY() && !m.Config.Raw {
 			return m.Output
 		}
 
-		m.clearOnce.Do(func() {
-			m.renderer.Output().ClearLine()
-		})
 		m.contentMutex.Lock()
 		for _, c := range m.content {
 			fmt.Print(c)
@@ -233,19 +228,10 @@ func (m *Mods) View() string {
 		m.content = []string{}
 		m.contentMutex.Unlock()
 	case doneState:
-		if m.Config.Glamour {
-			if m.viewportNeeded() {
-				return m.glamViewport.View()
-			}
-			// We don't need the viewport yet.
-			return m.glamOutput + "\n"
+		if !isOutputTTY() {
+			fmt.Printf("\n")
 		}
-
-		if isOutputTTY() {
-			return m.Output + "\n"
-		}
-
-		fmt.Print("\n")
+		return ""
 	}
 	return ""
 }
@@ -262,13 +248,13 @@ func (m *Mods) retry(content string, err modsError) tea.Msg {
 	if m.retries >= m.Config.MaxRetries {
 		return err
 	}
-	wait := time.Millisecond * 100 * time.Duration(math.Pow(2, float64(m.retries))) //nolint:gomnd
+	wait := time.Millisecond * 100 * time.Duration(math.Pow(2, float64(m.retries))) //nolint:mnd
 	time.Sleep(wait)
 	return completionInput{content}
 }
 
 func (m *Mods) startCompletionCmd(content string) tea.Cmd {
-	if m.Config.Show != "" {
+	if m.Config.Show != "" || m.Config.ShowLast {
 		return m.readFromCache()
 	}
 
@@ -276,8 +262,11 @@ func (m *Mods) startCompletionCmd(content string) tea.Cmd {
 		var ok bool
 		var mod Model
 		var api API
-		var key string
 		var ccfg openai.ClientConfig
+		var accfg AnthropicClientConfig
+		var cccfg CohereClientConfig
+		var occfg OllamaClientConfig
+		var gccfg GoogleClientConfig
 
 		cfg := m.Config
 		mod, ok = cfg.Models[cfg.Model]
@@ -288,10 +277,10 @@ func (m *Mods) startCompletionCmd(content string) tea.Cmd {
 						"Model %s is not in the settings file.",
 						m.Styles.InlineCode.Render(cfg.Model),
 					),
-					err: fmt.Errorf(
+					err: newUserErrorf(
 						"Please specify an API endpoint with %s or configure the model in the settings: %s",
 						m.Styles.InlineCode.Render("--api"),
-						m.Styles.InlineCode.Render("mods -s"),
+						m.Styles.InlineCode.Render("mods --settings"),
 					),
 				}
 			}
@@ -311,7 +300,7 @@ func (m *Mods) startCompletionCmd(content string) tea.Cmd {
 				eps = append(eps, m.Styles.InlineCode.Render(a.Name))
 			}
 			return modsError{
-				err: fmt.Errorf(
+				err: newUserErrorf(
 					"Your configured API endpoints are: %s",
 					eps,
 				),
@@ -321,53 +310,69 @@ func (m *Mods) startCompletionCmd(content string) tea.Cmd {
 				),
 			}
 		}
-		if api.APIKeyEnv != "" {
-			key = os.Getenv(api.APIKeyEnv)
-		}
 
 		switch mod.API {
-		case "openai":
-			if key == "" {
-				key = os.Getenv("OPENAI_API_KEY")
+		case "ollama":
+			occfg = DefaultOllamaConfig()
+			if api.BaseURL != "" {
+				occfg.BaseURL = api.BaseURL
 			}
-			if key == "" {
-				return modsError{
-					reason: fmt.Sprintf(
-						"%s environment variable is required.",
-						m.Styles.InlineCode.Render("OPENAI_API_KEY"),
-					),
-					err: fmt.Errorf(
-						"You can grab one at %s",
-						m.Styles.Link.Render("https://platform.openai.com/account/api-keys."),
-					),
-				}
+		case "anthropic":
+			key, err := m.ensureKey(api, "ANTHROPIC_API_KEY", "https://console.anthropic.com/settings/keys")
+			if err != nil {
+				return modsError{err, "Anthropic authentication failed"}
 			}
-			ccfg = openai.DefaultConfig(key)
+			accfg = DefaultAnthropicConfig(key)
+			if api.BaseURL != "" {
+				accfg.BaseURL = api.BaseURL
+			}
+			if api.Version != "" {
+				accfg.Version = AnthropicAPIVersion(api.Version)
+			}
+		case "google":
+			key, err := m.ensureKey(api, "GOOGLE_API_KEY", "https://aistudio.google.com/app/apikey")
+			if err != nil {
+				return modsError{err, "Google authentication failed"}
+			}
+			gccfg = DefaultGoogleConfig(mod.Name, key)
+		case "cohere":
+			key, err := m.ensureKey(api, "COHERE_API_KEY", "https://dashboard.cohere.com/api-keys")
+			if err != nil {
+				return modsError{err, "Cohere authentication failed"}
+			}
+			cccfg = DefaultCohereConfig(key)
 			if api.BaseURL != "" {
 				ccfg.BaseURL = api.BaseURL
 			}
 		case "azure", "azure-ad":
-			if key == "" {
-				key = os.Getenv("AZURE_OPENAI_KEY")
-			}
-			if key == "" {
-				return modsError{
-					reason: fmt.Sprintf(
-						"%s environment variable is required.",
-						m.Styles.InlineCode.Render("AZURE_OPENAI_KEY"),
-					),
-					err: fmt.Errorf(
-						"You can apply for one at %s",
-						m.Styles.Link.Render("https://aka.ms/oai/access"),
-					),
-				}
+			key, err := m.ensureKey(api, "AZURE_OPENAI_KEY", "https://aka.ms/oai/access")
+			if err != nil {
+				return modsError{err, "Azure authentication failed"}
 			}
 			ccfg = openai.DefaultAzureConfig(key, api.BaseURL)
 			if mod.API == "azure-ad" {
 				ccfg.APIType = openai.APITypeAzureAD
 			}
+			if api.User != "" {
+				cfg.User = api.User
+			}
+		case "copilot":
+			ghCopilotHTTPClient := newCopilotHTTPClient()
+			accessToken, err := getCopilotAccessToken(ghCopilotHTTPClient.client)
+			if err != nil {
+				return modsError{err, "Copilot authentication failed"}
+			}
+
+			ccfg = openai.DefaultConfig(accessToken.Token)
+			ccfg.HTTPClient = ghCopilotHTTPClient
+			ccfg.HTTPClient.(*copilotHTTPClient).AccessToken = &accessToken
+			ccfg.BaseURL = ordered.First(api.BaseURL, accessToken.Endpoints.API)
 
 		default:
+			key, err := m.ensureKey(api, "OPENAI_API_KEY", "https://platform.openai.com/account/api-keys")
+			if err != nil {
+				return modsError{err, "OpenAI authentication failed"}
+			}
 			ccfg = openai.DefaultConfig(key)
 			if api.BaseURL != "" {
 				ccfg.BaseURL = api.BaseURL
@@ -381,77 +386,95 @@ func (m *Mods) startCompletionCmd(content string) tea.Cmd {
 			}
 			httpClient := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
 			ccfg.HTTPClient = httpClient
+			accfg.HTTPClient = httpClient
+			cccfg.HTTPClient = httpClient
+			occfg.HTTPClient = httpClient
 		}
 
-		client := openai.NewClientWithConfig(ccfg)
-		ctx, cancel := context.WithCancel(context.Background())
-		m.cancelRequest = cancel
-		prefix := cfg.Prefix
-		if cfg.Format {
-			prefix = fmt.Sprintf("%s %s", prefix, cfg.FormatText)
-		}
-		if prefix != "" {
-			content = strings.TrimSpace(prefix + "\n\n" + content)
+		if mod.MaxChars == 0 {
+			mod.MaxChars = cfg.MaxInputChars
 		}
 
-		if !cfg.NoLimit {
-			if len(content) > mod.MaxChars {
-				content = content[:mod.MaxChars]
-			}
+		// Check if the model is an o1 model and unset the max_tokens parameter
+		// accordingly, as it's unsupported by o1.
+		// We do set max_completion_tokens instead, which is supported.
+		// Release won't have a prefix with a dash, so just putting o1 for match.
+		if strings.HasPrefix(mod.Name, "o1") {
+			cfg.MaxTokens = 0
 		}
 
-		m.messages = []openai.ChatCompletionMessage{}
-		if !cfg.NoCache && cfg.cacheReadFromID != "" {
-			if err := m.cache.read(cfg.cacheReadFromID, &m.messages); err != nil {
-				return modsError{
-					err: err,
-					reason: fmt.Sprintf(
-						"There was a problem reading the cache. Use %s / %s to disable it.",
-						m.Styles.InlineCode.Render("--no-cache"),
-						m.Styles.InlineCode.Render("NO_CACHE"),
-					),
-				}
-			}
+		switch mod.API {
+		case "anthropic":
+			return m.createAnthropicStream(content, accfg, mod)
+		case "google":
+			return m.createGoogleStream(content, gccfg, mod)
+		case "cohere":
+			return m.createCohereStream(content, cccfg, mod)
+		case "ollama":
+			return m.createOllamaStream(content, occfg, mod)
+		default:
+			return m.createOpenAIStream(content, ccfg, mod)
 		}
-
-		m.messages = append(m.messages, openai.ChatCompletionMessage{
-			Role:    openai.ChatMessageRoleUser,
-			Content: content,
-		})
-
-		stream, err := client.CreateChatCompletionStream(
-			ctx,
-			openai.ChatCompletionRequest{
-				Model:       mod.Name,
-				Temperature: noOmitFloat(cfg.Temperature),
-				TopP:        noOmitFloat(cfg.TopP),
-				MaxTokens:   cfg.MaxTokens,
-				Messages:    m.messages,
-				Stream:      true,
-			},
-		)
-		ae := &openai.APIError{}
-		if errors.As(err, &ae) {
-			return m.handleAPIError(ae, cfg, mod, content)
-		}
-
-		if err != nil {
-			return modsError{err, fmt.Sprintf(
-				"There was a problem with the %s API request.",
-				mod.API,
-			)}
-		}
-
-		return m.receiveCompletionStreamCmd(completionOutput{stream: stream})()
 	}
 }
 
-func (m *Mods) handleAPIError(err *openai.APIError, cfg *Config, mod Model, content string) tea.Msg {
+func (m Mods) ensureKey(api API, defaultEnv, docsURL string) (string, error) {
+	key := api.APIKey
+	if key == "" && api.APIKeyEnv != "" && api.APIKeyCmd == "" {
+		key = os.Getenv(api.APIKeyEnv)
+	}
+	if key == "" && api.APIKeyCmd != "" {
+		args, err := shellwords.Parse(api.APIKeyCmd)
+		if err != nil {
+			return "", modsError{err, "Failed to parse api-key-cmd"}
+		}
+		out, err := exec.Command(args[0], args[1:]...).CombinedOutput() //nolint:gosec
+		if err != nil {
+			return "", modsError{err, "Cannot exec api-key-cmd"}
+		}
+		key = strings.TrimSpace(string(out))
+	}
+	if key == "" {
+		key = os.Getenv(defaultEnv)
+	}
+	if key != "" {
+		return key, nil
+	}
+	return "", modsError{
+		reason: fmt.Sprintf(
+			"%[1]s required; set the environment variable %[1]s or update %[2]s through %[3]s.",
+			m.Styles.InlineCode.Render(defaultEnv),
+			m.Styles.InlineCode.Render("mods.yaml"),
+			m.Styles.InlineCode.Render("mods --settings"),
+		),
+		err: newUserErrorf(
+			"You can grab one at %s.",
+			m.Styles.Link.Render(docsURL),
+		),
+	}
+}
+
+func (m *Mods) handleRequestError(err error, mod Model, content string) tea.Msg {
+	ae := &openai.APIError{}
+	if errors.As(err, &ae) {
+		return m.handleAPIError(ae, mod, content)
+	}
+	return modsError{err, fmt.Sprintf(
+		"There was a problem with the %s API request.",
+		mod.API,
+	)}
+}
+
+func (m *Mods) handleAPIError(err *openai.APIError, mod Model, content string) tea.Msg {
+	cfg := m.Config
 	switch err.HTTPStatusCode {
 	case http.StatusNotFound:
 		if mod.Fallback != "" {
 			m.Config.Model = mod.Fallback
-			return m.retry(content, modsError{err: err, reason: "OpenAI API server error."})
+			return m.retry(content, modsError{
+				err:    err,
+				reason: fmt.Sprintf("%s API server error.", mod.API),
+			})
 		}
 		return modsError{err: err, reason: fmt.Sprintf(
 			"Missing model '%s' for API '%s'.",
@@ -464,16 +487,19 @@ func (m *Mods) handleAPIError(err *openai.APIError, cfg *Config, mod Model, cont
 			if cfg.NoLimit {
 				return pe
 			}
-			return m.retry(content[:len(content)-10], pe)
+
+			return m.retry(cutPrompt(err.Message, content), pe)
 		}
 		// bad request (do not retry)
-		return modsError{err: err, reason: "OpenAI API request error."}
+		return modsError{err: err, reason: fmt.Sprintf("%s API request error.", mod.API)}
 	case http.StatusUnauthorized:
 		// invalid auth or key (do not retry)
-		return modsError{err: err, reason: "Invalid OpenAI API key."}
+		return modsError{err: err, reason: fmt.Sprintf("Invalid %s API key.", mod.API)}
 	case http.StatusTooManyRequests:
 		// rate limiting or engine overload (wait and retry)
-		return m.retry(content, modsError{err: err, reason: "You’ve hit your OpenAI API rate limit."})
+		return m.retry(content, modsError{
+			err: err, reason: fmt.Sprintf("You’ve hit your %s API rate limit.", mod.API),
+		})
 	case http.StatusInternalServerError:
 		if mod.API == "openai" {
 			return m.retry(content, modsError{err: err, reason: "OpenAI API server error."})
@@ -492,41 +518,37 @@ func (m *Mods) receiveCompletionStreamCmd(msg completionOutput) tea.Cmd {
 	return func() tea.Msg {
 		resp, err := msg.stream.Recv()
 		if errors.Is(err, io.EOF) {
-			msg.stream.Close()
+			_ = msg.stream.Close()
 			m.messages = append(m.messages, openai.ChatCompletionMessage{
-				Role:    openai.ChatMessageRoleSystem,
+				Role:    openai.ChatMessageRoleAssistant,
 				Content: m.Output,
 			})
 			return completionOutput{}
 		}
 		if err != nil {
-			msg.stream.Close()
+			_ = msg.stream.Close()
 			return modsError{err, "There was an error when streaming the API response."}
 		}
-		msg.content = resp.Choices[0].Delta.Content
+		if len(resp.Choices) > 0 {
+			msg.content = resp.Choices[0].Delta.Content
+		}
 		return msg
 	}
 }
 
 type cacheDetailsMsg struct {
-	WriteID, Title, ReadID string
+	WriteID, Title, ReadID, Model string
 }
 
 func (m *Mods) findCacheOpsDetails() tea.Cmd {
 	return func() tea.Msg {
 		continueLast := m.Config.ContinueLast || (m.Config.Continue != "" && m.Config.Title == "")
-		readID := firstNonEmpty(m.Config.Continue, m.Config.Show)
-		writeID := firstNonEmpty(m.Config.Title, m.Config.Continue)
+		readID := ordered.First(m.Config.Continue, m.Config.Show)
+		writeID := ordered.First(m.Config.Title, m.Config.Continue)
 		title := writeID
+		model := config.Model
 
-		if continueLast && m.Config.Prefix == "" {
-			return modsError{
-				err:    fmt.Errorf("Missing prompt"),
-				reason: "You must specify a prompt.",
-			}
-		}
-
-		if readID != "" || continueLast {
+		if readID != "" || continueLast || m.Config.ShowLast {
 			found, err := m.findReadID(readID)
 			if err != nil {
 				return modsError{
@@ -534,7 +556,12 @@ func (m *Mods) findCacheOpsDetails() tea.Cmd {
 					reason: "Could not find the conversation.",
 				}
 			}
-			readID = found
+			if found != nil {
+				readID = found.ID
+				if found.Model != nil {
+					model = *found.Model
+				}
+			}
 		}
 
 		// if we are continuing last, update the existing conversation
@@ -560,33 +587,35 @@ func (m *Mods) findCacheOpsDetails() tea.Cmd {
 			WriteID: writeID,
 			Title:   title,
 			ReadID:  readID,
+			Model:   model,
 		}
 	}
 }
 
-func (m *Mods) findReadID(in string) (string, error) {
+func (m *Mods) findReadID(in string) (*Conversation, error) {
 	convo, err := m.db.Find(in)
 	if err == nil {
-		return convo.ID, nil
+		return convo, nil
 	}
 	if errors.Is(err, errNoMatches) && m.Config.Show == "" {
 		convo, err := m.db.FindHEAD()
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		return convo.ID, nil
+		return convo, nil
 	}
-	return "", err
+	return nil, err
 }
 
-func readStdinCmd() tea.Msg {
+func (m *Mods) readStdinCmd() tea.Msg {
 	if !isInputTTY() {
 		reader := bufio.NewReader(os.Stdin)
 		stdinBytes, err := io.ReadAll(reader)
 		if err != nil {
 			return modsError{err, "Unable to read stdin."}
 		}
-		return completionInput{string(stdinBytes)}
+
+		return completionInput{increaseIndent(string(stdinBytes))}
 	}
 	return completionInput{""}
 }
@@ -617,4 +646,99 @@ func (m *Mods) readFromCache() tea.Cmd {
 			},
 		})()
 	}
+}
+
+const tabWidth = 4
+
+func (m *Mods) appendToOutput(s string) {
+	m.Output += s
+	if !isOutputTTY() || m.Config.Raw {
+		m.contentMutex.Lock()
+		m.content = append(m.content, s)
+		m.contentMutex.Unlock()
+		return
+	}
+
+	wasAtBottom := m.glamViewport.ScrollPercent() == 1.0
+	oldHeight := m.glamHeight
+	m.glamOutput, _ = m.glam.Render(m.Output)
+	m.glamOutput = strings.TrimRightFunc(m.glamOutput, unicode.IsSpace)
+	m.glamOutput = strings.ReplaceAll(m.glamOutput, "\t", strings.Repeat(" ", tabWidth))
+	m.glamHeight = lipgloss.Height(m.glamOutput)
+	m.glamOutput += "\n"
+	truncatedGlamOutput := m.renderer.NewStyle().MaxWidth(m.width).Render(m.glamOutput)
+	m.glamViewport.SetContent(truncatedGlamOutput)
+	if oldHeight < m.glamHeight && wasAtBottom {
+		// If the viewport's at the bottom and we've received a new
+		// line of content, follow the output by auto scrolling to
+		// the bottom.
+		m.glamViewport.GotoBottom()
+	}
+}
+
+// if the input is whitespace only, make it empty.
+func removeWhitespace(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return ""
+	}
+	return s
+}
+
+func responseFormat(cfg *Config) *openai.ChatCompletionResponseFormat {
+	if cfg.API != "openai" {
+		// only openai's api supports ChatCompletionResponseFormat
+		return nil
+	}
+	return &openai.ChatCompletionResponseFormat{
+		Type: responseType(cfg),
+	}
+}
+
+func responseType(cfg *Config) openai.ChatCompletionResponseFormatType {
+	if !cfg.Format {
+		return openai.ChatCompletionResponseFormatTypeText
+	}
+	// only these two models support json
+	if cfg.Model != "gpt-4-1106-preview" && cfg.Model != "gpt-3.5-turbo-1106" {
+		return openai.ChatCompletionResponseFormatTypeText
+	}
+	switch cfg.FormatAs {
+	case "json":
+		return openai.ChatCompletionResponseFormatTypeJSONObject
+	default:
+		return openai.ChatCompletionResponseFormatTypeText
+	}
+}
+
+var tokenErrRe = regexp.MustCompile(`This model's maximum context length is (\d+) tokens. However, your messages resulted in (\d+) tokens`)
+
+func cutPrompt(msg, prompt string) string {
+	found := tokenErrRe.FindStringSubmatch(msg)
+	if len(found) != 3 { //nolint:mnd
+		return prompt
+	}
+
+	maxt, _ := strconv.Atoi(found[1])
+	current, _ := strconv.Atoi(found[2])
+
+	if maxt > current {
+		return prompt
+	}
+
+	// 1 token =~ 4 chars
+	// cut 10 extra chars 'just in case'
+	reduceBy := 10 + (current-maxt)*4 //nolint:mnd
+	if len(prompt) > reduceBy {
+		return prompt[:len(prompt)-reduceBy]
+	}
+
+	return prompt
+}
+
+func increaseIndent(s string) string {
+	lines := strings.Split(s, "\n")
+	for i := 0; i < len(lines); i++ {
+		lines[i] = "\t" + lines[i]
+	}
+	return strings.Join(lines, "\n")
 }
